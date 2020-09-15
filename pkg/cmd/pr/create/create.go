@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/api"
 	"github.com/cli/cli/context"
@@ -17,6 +18,7 @@ import (
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/githubtemplate"
 	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/pkg/prompt"
 	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
@@ -147,6 +149,10 @@ func createRun(opts *CreateOptions) error {
 		return fmt.Errorf("could not determine the current branch: %w", err)
 	}
 
+	if ucc, err := git.UncommittedChangeCount(); err == nil && ucc > 0 {
+		fmt.Fprintf(opts.IO.ErrOut, "Warning: %s\n", utils.Pluralize(ucc, "uncommitted change"))
+	}
+
 	var headRepo ghrepo.Interface
 	var headRemote *context.Remote
 
@@ -163,11 +169,58 @@ func createRun(opts *CreateOptions) error {
 		}
 	}
 
-	// otherwise, determine the head repository with info obtained from the API
-	if headRepo == nil {
-		if r, err := repoContext.HeadRepo(baseRepo); err == nil {
-			headRepo = r
+	// otherwise, ask the user for the head repository using info obtained from the API
+	if headRepo == nil && opts.IO.CanPrompt() {
+		pushableRepos, err := repoContext.HeadRepos()
+		if err != nil {
+			return err
 		}
+
+		if len(pushableRepos) == 0 {
+			pushableRepos, err = api.RepoFindForks(client, baseRepo, 3)
+			if err != nil {
+				return err
+			}
+		}
+
+		currentLogin, err := api.CurrentLoginName(client, baseRepo.RepoHost())
+		if err != nil {
+			return err
+		}
+
+		hasOwnFork := false
+		var pushOptions []string
+		for _, r := range pushableRepos {
+			pushOptions = append(pushOptions, ghrepo.FullName(r))
+			if r.RepoOwner() == currentLogin {
+				hasOwnFork = true
+			}
+		}
+
+		if !hasOwnFork {
+			pushOptions = append(pushOptions, "Create a fork of "+ghrepo.FullName(baseRepo))
+		}
+		pushOptions = append(pushOptions, "Cancel")
+
+		var selectedOption int
+		err = prompt.SurveyAskOne(&survey.Select{
+			Message: fmt.Sprintf("Where should we push the '%s' branch?", headBranch),
+			Options: pushOptions,
+		}, &selectedOption)
+		if err != nil {
+			return err
+		}
+
+		if selectedOption < len(pushableRepos) {
+			headRepo = pushableRepos[selectedOption]
+		} else if pushOptions[selectedOption] == "Cancel" {
+			return cmdutil.SilentError
+		}
+	}
+
+	if headRepo == nil && !opts.IO.CanPrompt() {
+		fmt.Fprintf(opts.IO.ErrOut, "error: you must first push the current branch to a remote")
+		return cmdutil.SilentError
 	}
 
 	baseBranch := opts.BaseBranch
@@ -176,10 +229,6 @@ func createRun(opts *CreateOptions) error {
 	}
 	if headBranch == baseBranch && headRepo != nil && ghrepo.IsSame(baseRepo, headRepo) {
 		return fmt.Errorf("must be on a branch named differently than %q", baseBranch)
-	}
-
-	if ucc, err := git.UncommittedChangeCount(); err == nil && ucc > 0 {
-		fmt.Fprintf(opts.IO.ErrOut, "Warning: %s\n", utils.Pluralize(ucc, "uncommitted change"))
 	}
 
 	var milestoneTitles []string
